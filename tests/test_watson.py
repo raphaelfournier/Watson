@@ -271,6 +271,15 @@ my project = A B
     assert watson.current['tags'] == ['C', 'D', 'A', 'B']
 
 
+def test_start_nogap(mock, watson):
+
+    watson.start('foo')
+    watson.stop()
+    watson.start('bar', gap=False)
+
+    assert watson.frames[-1].stop == watson.current['start']
+
+
 # stop
 
 def test_stop_started_project(watson):
@@ -302,6 +311,24 @@ def test_stop_started_project_without_tags(watson):
 def test_stop_no_project(watson):
     with pytest.raises(WatsonError):
         watson.stop()
+
+
+def test_stop_started_project_at(watson):
+    watson.start('foo')
+    now = arrow.now()
+
+    with pytest.raises(WatsonError):
+        time_str = '1970-01-01T00:00'
+        time_obj = arrow.get(time_str)
+        watson.stop(stop_at=time_obj)
+
+    with pytest.raises(ValueError):
+        time_str = '2999-31-12T23:59'
+        time_obj = arrow.get(time_str)
+        watson.stop(stop_at=time_obj)
+
+    watson.stop(stop_at=now)
+    assert watson.frames[-1].stop == now
 
 
 # cancel
@@ -744,6 +771,56 @@ def test_report(watson):
     assert len(report['projects'][0]['tags']) == 1
     assert report['projects'][0]['tags'][0]['name'] == 'B'
 
+    watson.start('baz', tags=['D'])
+    watson.stop()
+
+    report = watson.report(arrow.now(), arrow.now(), projects=["foo"])
+    assert len(report['projects']) == 1
+
+    report = watson.report(arrow.now(), arrow.now(), ignore_projects=["bar"])
+    assert len(report['projects']) == 2
+
+    report = watson.report(arrow.now(), arrow.now(), tags=["A"])
+    assert len(report['projects']) == 1
+
+    report = watson.report(arrow.now(), arrow.now(), ignore_tags=["D"])
+    assert len(report['projects']) == 2
+
+    with pytest.raises(WatsonError):
+        watson.report(
+            arrow.now(), arrow.now(), projects=["foo"], ignore_projects=["foo"]
+        )
+
+    with pytest.raises(WatsonError):
+        watson.report(arrow.now(), arrow.now(), tags=["A"], ignore_tags=["A"])
+
+
+def test_report_current(mock, config_dir):
+    mock.patch('arrow.utcnow', return_value=arrow.get(5000))
+
+    watson = Watson(
+        current={'project': 'foo', 'start': 4000},
+        config_dir=config_dir
+    )
+
+    for _ in range(2):
+        report = watson.report(
+            arrow.utcnow(), arrow.utcnow(), current=True, projects=['foo']
+        )
+    assert len(report['projects']) == 1
+    assert report['projects'][0]['name'] == 'foo'
+    assert report['projects'][0]['time'] == pytest.approx(1000)
+
+    report = watson.report(
+        arrow.utcnow(), arrow.utcnow(), current=False, projects=['foo']
+    )
+    assert len(report['projects']) == 0
+
+    report = watson.report(
+        arrow.utcnow(), arrow.utcnow(), projects=['foo']
+    )
+    assert len(report['projects']) == 0
+
 
 # renaming project updates frame last_updated time
 def test_rename_project_with_time(mock, watson):
@@ -836,3 +913,16 @@ def test_add_failure(mock, watson):
     with pytest.raises(WatsonError):
         watson.add(project="test_project", tags=['fuu', 'bar'],
                    from_date=7000, to_date=6000)
+
+
+def test_validate_report_options(mock, watson):
+    assert watson._validate_report_options(["project_foo"], None)
+    assert watson._validate_report_options(None, ["project_foo"])
+    assert not watson._validate_report_options(["project_foo"],
+                                               ["project_foo"])
+    assert watson._validate_report_options(["project_foo"], ["project_bar"])
+    assert not watson._validate_report_options(["project_foo", "project_bar"],
+                                               ["project_foo"])
+    assert not watson._validate_report_options(["project_foo", "project_bar"],
+                                               ["project_foo", "project_bar"])
+    assert watson._validate_report_options(None, None)

@@ -6,6 +6,118 @@
     $ make docs-->
 
 # Commands
+## `add`
+
+```bash
+Usage:  watson add [OPTIONS] [ARGS]...
+```
+
+Add time for project with tag(s) that was not tracked live.
+
+Example:
+
+
+    $ watson add --from "2018-03-20 12:00:00" --to "2018-03-20 13:00:00" \
+     programming +addfeature
+
+### Options
+
+Flag | Help
+-----|-----
+`-f, --from DATE` | Date and time of start of tracked activity  [required]
+`-t, --to DATE` | Date and time of end of tracked activity  [required]
+`-c, --confirm-new-project` | Confirm addition of new project.
+`-b, --confirm-new-tag` | Confirm creation of new tag.
+`--help` | Show this message and exit.
+
+## `aggregate`
+
+```bash
+Usage:  watson aggregate [OPTIONS]
+```
+
+Display a report of the time spent on each project aggregated by day.
+
+If a project is given, the time spent on this project is printed.
+Else, print the total for each root project.
+
+By default, the time spent the last 7 days is printed. This timespan
+can be controlled with the `--from` and `--to` arguments. The dates
+must have the format `YEAR-MONTH-DAY`, like: `2014-05-19`.
+
+You can limit the report to a project or a tag using the `--project` and
+`--tag` options. They can be specified several times each to add multiple
+projects or tags to the report.
+
+If you are outputting to the terminal, you can selectively enable a pager
+through the `--pager` option.
+
+You can change the output format from *plain text* to *JSON* using the
+`--json` option or to *CSV* using the `--csv` option. Only one  of these
+two options can be used at once.
+
+
+Example:
+
+
+    $ watson aggregate
+    Wed 14 November 2018 - 5h 42m 22s
+      watson - 5h 42m 22s
+            [features     34m 06s]
+            [docs  5h 08m 16s]
+    
+    Thu 15 November 2018 - 00s
+    
+    Fri 16 November 2018 - 00s
+    
+    Sat 17 November 2018 - 00s
+    
+    Sun 18 November 2018 - 00s
+    
+    Mon 19 November 2018 - 5h 58m 52s
+      watson - 5h 58m 52s
+            [features  1h 12m 03s]
+            [docs  4h 46m 49s]
+    
+    Tue 20 November 2018 - 2h 50m 35s
+      watson - 2h 50m 35s
+            [features     15m 17s]
+            [docs  1h 37m 43s]
+            [website     57m 35s]
+    
+    Wed 21 November 2018 - 01m 17s
+      watson - 01m 17s
+            [docs     01m 17s]
+    
+    $ watson aggregate --csv
+    from,to,project,tag,time
+    2018-11-14 00:00:00,2018-11-14 23:59:59,watson,,20542.0
+    2018-11-14 00:00:00,2018-11-14 23:59:59,watson,features,2046.0
+    2018-11-14 00:00:00,2018-11-14 23:59:59,watson,docs,18496.0
+    2018-11-19 00:00:00,2018-11-19 23:59:59,watson,,21532.0
+    2018-11-19 00:00:00,2018-11-19 23:59:59,watson,features,4323.0
+    2018-11-19 00:00:00,2018-11-19 23:59:59,watson,docs,17209.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,,10235.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,features,917.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,docs,5863.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,website,3455.0
+    2018-11-21 00:00:00,2018-11-21 23:59:59,watson,,77.0
+    2018-11-21 00:00:00,2018-11-21 23:59:59,watson,docs,77.0
+
+### Options
+
+Flag | Help
+-----|-----
+`-c, --current / -C, --no-current` | (Don't) include currently running frame in report.
+`-f, --from DATE` | The date from when the report should start. Defaults to seven days ago.
+`-t, --to DATE` | The date at which the report should stop (inclusive). Defaults to tomorrow.
+`-p, --project TEXT` | Reports activity only for the given project. You can add other projects by using this option several times.
+`-T, --tag TEXT` | Reports activity only for frames containing the given tag. You can add several tags by using this option multiple times
+`-j, --json` | Format output in JSON instead of plain text
+`-s, --csv` | Format output in CSV instead of plain text
+`-g, --pager / -G, --no-pager` | (Don't) view output through a pager.
+`--help` | Show this message and exit.
+
 ## `cancel`
 
 ```bash
@@ -71,6 +183,8 @@ to `vim`, `nano` or `vi` (first one found) on all other systems.
 
 Flag | Help
 -----|-----
+`-c, --confirm-new-project` | Confirm addition of new project.
+`-b, --confirm-new-tag` | Confirm creation of new tag.
 `--help` | Show this message and exit.
 
 ## `frames`
@@ -136,6 +250,10 @@ You can limit the log to a project or a tag using the `--project` and
 `--tag` options. They can be specified several times each to add multiple
 projects or tags to the log.
 
+You can change the output format from *plain text* to *JSON* using the
+`--json` option or to *CSV* using the `--csv` option. Only one  of these
+two options can be used at once.
+
 Example:
 
 
@@ -164,6 +282,14 @@ Example:
     Wednesday 16 April 2014 (5h 19m 18s)
             02cb269  09:53 to 12:43   2h 50m 07s  apollo11  [wheels]
             1070ddb  13:48 to 16:17   2h 29m 11s  voyager1  [antenna, sensors]
+    
+    $ watson log --from 2014-04-16 --to 2014-04-17 --csv
+    id,start,stop,project,tags
+    a96fcde,2014-04-17 09:15,2014-04-17 09:43,hubble,"lens, camera, transmission"
+    5e91316,2014-04-17 10:19,2014-04-17 12:59,hubble,"camera, transmission"
+    761dd51,2014-04-17 14:42,2014-04-17 15:54,voyager1,antenna
+    02cb269,2014-04-16 09:53,2014-04-16 12:43,apollo11,wheels
+    1070ddb,2014-04-16 13:48,2014-04-16 16:17,voyager1,"antenna, sensors"
 
 ### Options
 
@@ -180,7 +306,8 @@ Flag | Help
 `-a, --all` | Reports all activities.
 `-p, --project TEXT` | Logs activity only for the given project. You can add other projects by using this option several times.
 `-T, --tag TEXT` | Logs activity only for frames containing the given tag. You can add several tags by using this option multiple times
-`-j, --json` | Format the log in JSON instead of plain text
+`-j, --json` | Format output in JSON instead of plain text
+`-s, --csv` | Format output in CSV instead of plain text
 `-g, --pager / -G, --no-pager` | (Don't) view output through a pager.
 `--help` | Show this message and exit.
 
@@ -335,15 +462,17 @@ respectively.
 The shortcut `--luna` sets the timespan to the current moon cycle with
 the last full moon marking the start of the cycle.
 
-You can limit the report to a project or a tag using the `--project` and
-`--tag` options. They can be specified several times each to add multiple
-projects or tags to the report.
+You can limit the report to a project or a tag using the `--project`,
+`--tag`, `--ignore-project` and `--ignore-tag` options. They can be
+specified several times each to add or ignore multiple projects or
+tags to the report.
 
 If you are outputting to the terminal, you can selectively enable a pager
 through the `--pager` option.
 
 You can change the output format for the report from *plain text* to *JSON*
-by using the `--json` option.
+using the `--json` option or to *CSV* using the `--csv` option. Only one
+of these two options can be used at once.
 
 Example:
 
@@ -411,6 +540,15 @@ Example:
             "to": "2016-02-28T23:59:59.999999-08:00"
         }
     }
+    
+    $ watson report --from 2014-04-01 --to 2014-04-30 --project apollo11 --csv
+    from,to,project,tag,time
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,,48140.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,brakes,28421.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,module,27701.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,reactor,30950.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,steering,38017.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,wheels,36695.0
 
 ### Options
 
@@ -427,7 +565,10 @@ Flag | Help
 `-a, --all` | Reports all activities.
 `-p, --project TEXT` | Reports activity only for the given project. You can add other projects by using this option several times.
 `-T, --tag TEXT` | Reports activity only for frames containing the given tag. You can add several tags by using this option multiple times
-`-j, --json` | Format the report in JSON instead of plain text
+`--ignore-project TEXT` | Reports activity for all projects but the given ones. You can ignore several projects by using the option multiple times. Any given project will be ignored
+`--ignore-tag TEXT` | Reports activity for all tags but the given ones. You can ignore several tags by using the option multiple times. Any given tag will be ignored
+`-j, --json` | Format output in JSON instead of plain text
+`-s, --csv` | Format output in CSV instead of plain text
 `-g, --pager / -G, --no-pager` | (Don't) view output through a pager.
 `--help` | Show this message and exit.
 
@@ -485,16 +626,22 @@ If there is already a running project and the configuration option
 `options.stop_on_start` is set to a true value (`1`, `on`, `true` or
 `yes`), it is stopped before the new project is started.
 
+If the '--no-gap' flag is given, the start time of the new project is set
+to the stop time of the most recently stopped project.
+
 Example:
 
 
-    $ watson start apollo11 +module +brakes
+    $ watson start apollo11 +module +brakes --no-gap
     Starting project apollo11 [module, brakes] at 16:34
 
 ### Options
 
 Flag | Help
 -----|-----
+`-g, --gap / -G, --no-gap` | (Don't) leave gap between end time of previous project and start time of the current.
+`-c, --confirm-new-project` | Confirm addition of new project.
+`-b, --confirm-new-tag` | Confirm creation of new tag.
 `--help` | Show this message and exit.
 
 ## `status`
@@ -538,16 +685,21 @@ Usage:  watson stop [OPTIONS]
 
 Stop monitoring time for the current project.
 
+If '--at' option is given, the provided stopping time is used. The
+specified time must be after the begin of the to be ended frame and must
+not be in the future.
+
 Example:
 
 
-    $ watson stop
-    Stopping project apollo11, started a minute ago. (id: e7ccd52)
+    $ watson stop --at 13:37
+    Stopping project apollo11, started an hour ago and stopped 30 minutes ago. (id: e9ccd52) # noqa: E501
 
 ### Options
 
 Flag | Help
 -----|-----
+`--at TIME` | Stop frame at this time. Must be in (YYYY-MM-DDT)?HH:MM(:SS)? format.
 `--help` | Show this message and exit.
 
 ## `sync`

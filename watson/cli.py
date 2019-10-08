@@ -5,18 +5,33 @@ import itertools
 import json
 import operator
 import os
+import re
 
 from dateutil import tz
-from functools import reduce
+from functools import reduce, wraps
 
 import arrow
 import click
+from click_didyoumean import DYMGroup
 
 from . import watson as _watson
 from .frames import Frame
-from .utils import (format_timedelta, get_frame_from_argument,
-                    get_start_time_for_period, options, safe_save,
-                    sorted_groupby, style, parse_tags)
+from .utils import (
+    apply_weekday_offset,
+    build_csv,
+    confirm_project,
+    confirm_tags,
+    flatten_report_for_csv,
+    format_timedelta,
+    frames_to_csv,
+    frames_to_json,
+    get_frame_from_argument,
+    get_start_time_for_period,
+    options, safe_save,
+    sorted_groupby,
+    style,
+    parse_tags,
+)
 
 
 class MutuallyExclusiveOption(click.Option):
@@ -25,26 +40,25 @@ class MutuallyExclusiveOption(click.Option):
         super(MutuallyExclusiveOption, self).__init__(*args, **kwargs)
 
     def handle_parse_result(self, ctx, opts, args):
-        if self.mutually_exclusive.intersection(opts) and self.name in opts:
-            raise click.UsageError(
-                '`--{name}` is mutually exclusive with the following options: '
-                '{options}'.format(name=self.name.replace('_', ''),
-                                   options=', '
-                                   .join(['`--{}`'.format(_) for _ in
-                                         self.mutually_exclusive]))
-            )
-
+        if self.name in opts:
+            if self.mutually_exclusive.intersection(opts):
+                self._raise_exclusive_error()
+            if self.multiple and len(set(opts[self.name])) > 1:
+                self._raise_exclusive_error()
         return super(MutuallyExclusiveOption, self).handle_parse_result(
             ctx, opts, args
         )
 
-
-class WatsonCliError(click.ClickException):
-    def format_message(self):
-        return style('error', self.message)
-
-
-_watson.WatsonError = WatsonCliError
+    def _raise_exclusive_error(self):
+        # Use self.opts[-1] instead of self.name to handle options with a
+        # different internal name.
+        self.mutually_exclusive.add(self.opts[-1].strip('-'))
+        raise click.ClickException(
+            style(
+                'error',
+                'The following options are mutually exclusive: '
+                '{options}'.format(options=', '.join(
+                    ['`--{}`'.format(_) for _ in self.mutually_exclusive]))))
 
 
 class DateParamType(click.ParamType):
@@ -52,18 +66,64 @@ class DateParamType(click.ParamType):
 
     def convert(self, value, param, ctx):
         if value:
-            date = arrow.get(value)
+            try:
+                date = arrow.get(value)
+            except (ValueError, TypeError) as e:
+                raise click.UsageError(str(e))
             # When we parse a date, we want to parse it in the timezone
             # expected by the user, so that midnight is midnight in the local
             # timezone, not in UTC. Cf issue #16.
             date.tzinfo = tz.tzlocal()
+            # Add an offset to match the week beginning specified in the
+            # configuration
+            if param.name == "week":
+                week_start = ctx.obj.config.get(
+                    "options", "week_start", "monday")
+                date = apply_weekday_offset(
+                    start_time=date, week_start=week_start)
             return date
 
 
+class TimeParamType(click.ParamType):
+    name = 'time'
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, arrow.Arrow):
+            return value
+
+        date_pattern = r'\d{4}-\d\d-\d\d'
+        time_pattern = r'\d\d:\d\d(:\d\d)?'
+
+        if re.match('^{time_pat}$'.format(time_pat=time_pattern), value):
+            cur_date = arrow.now().date().isoformat()
+            cur_time = '{date}T{time}'.format(date=cur_date, time=value)
+        elif re.match('^{date_pat}T{time_pat}'.format(
+                date_pat=date_pattern, time_pat=time_pattern), value):
+            cur_time = value
+        else:
+            errmsg = ('Could not parse time.'
+                      'Please specify in (YYYY-MM-DDT)?HH:MM(:SS)? format.')
+            raise click.ClickException(style('error', errmsg))
+
+        local_tz = tz.tzlocal()
+        return arrow.get(cur_time).replace(tzinfo=local_tz)
+
+
 Date = DateParamType()
+Time = TimeParamType()
 
 
-@click.group()
+def catch_watson_error(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except _watson.WatsonError as e:
+            raise click.ClickException(style('error', str(e)))
+    return wrapper
+
+
+@click.group(cls=DYMGroup)
 @click.version_option(version=_watson.__version__, prog_name='Watson')
 @click.pass_context
 def cli(ctx):
@@ -99,11 +159,11 @@ def help(ctx, command):
     click.echo(cmd.get_help(ctx))
 
 
-def _start(watson, project, tags, restart=False):
+def _start(watson, project, tags, restart=False, gap=True):
     """
     Start project with given list of tags and save status.
     """
-    current = watson.start(project, tags, restart=restart)
+    current = watson.start(project, tags, restart=restart, gap=gap)
     click.echo(u"Starting project {}{} at {}".format(
         style('project', project),
         (" " if current['tags'] else "") + style('tags', current['tags']),
@@ -113,10 +173,18 @@ def _start(watson, project, tags, restart=False):
 
 
 @cli.command()
+@click.option('-g/-G', '--gap/--no-gap', 'gap_', is_flag=True, default=True,
+              help=("(Don't) leave gap between end time of previous project "
+                    "and start time of the current."))
 @click.argument('args', nargs=-1)
+@click.option('-c', '--confirm-new-project', is_flag=True, default=False,
+              help="Confirm addition of new project.")
+@click.option('-b', '--confirm-new-tag', is_flag=True, default=False,
+              help="Confirm creation of new tag.")
 @click.pass_obj
 @click.pass_context
-def start(ctx, watson, args):
+@catch_watson_error
+def start(ctx, watson, confirm_new_project, confirm_new_tag, args, gap_=True):
     """
     Start monitoring time for the given project.
     You can add tags indicating more specifically what you are working on with
@@ -126,44 +194,79 @@ def start(ctx, watson, args):
     `options.stop_on_start` is set to a true value (`1`, `on`, `true` or
     `yes`), it is stopped before the new project is started.
 
+    If the '--no-gap' flag is given, the start time of the new project is set
+    to the stop time of the most recently stopped project.
+
     Example:
 
     \b
-    $ watson start apollo11 +module +brakes
+    $ watson start apollo11 +module +brakes --no-gap
     Starting project apollo11 [module, brakes] at 16:34
     """
     project = ' '.join(
         itertools.takewhile(lambda s: not s.startswith('+'), args)
     )
+    if not project:
+        raise click.ClickException("No project given.")
+
+    # Confirm creation of new project if that option is set
+    if (watson.config.getboolean('options', 'confirm_new_project') or
+            confirm_new_project):
+        confirm_project(project, watson.projects)
 
     # Parse all the tags
     tags = parse_tags(args)
+
+    # Confirm creation of new tag(s) if that option is set
+    if (watson.config.getboolean('options', 'confirm_new_tag') or
+            confirm_new_tag):
+        confirm_tags(tags, watson.tags)
+
+    if project and watson.is_started and not gap_:
+        current = watson.current
+        errmsg = ("Project '{}' is already started and '--no-gap' is passed. "
+                  "Please stop manually.")
+        raise click.ClickException(
+            style(
+                'error', errmsg.format(current['project'])
+            )
+        )
 
     if (project and watson.is_started and
             watson.config.getboolean('options', 'stop_on_start')):
         ctx.invoke(stop)
 
-    _start(watson, project, tags)
+    _start(watson, project, tags, gap=gap_)
 
 
-@cli.command()
+@cli.command(context_settings={'ignore_unknown_options': True})
+@click.option('--at', 'at_', type=Time, default=None,
+              help=('Stop frame at this time. Must be in '
+                    '(YYYY-MM-DDT)?HH:MM(:SS)? format.'))
 @click.pass_obj
-def stop(watson):
+@catch_watson_error
+def stop(watson, at_):
     """
     Stop monitoring time for the current project.
+
+    If '--at' option is given, the provided stopping time is used. The
+    specified time must be after the begin of the to be ended frame and must
+    not be in the future.
 
     Example:
 
     \b
-    $ watson stop
-    Stopping project apollo11, started a minute ago. (id: e7ccd52)
+    $ watson stop --at 13:37
+    Stopping project apollo11, started an hour ago and stopped 30 minutes ago. (id: e9ccd52) # noqa: E501
     """
-    frame = watson.stop()
-    click.echo(u"Stopping project {}{}, started {}. (id: {})".format(
+    frame = watson.stop(stop_at=at_)
+    output_str = u"Stopping project {}{}, started {} and stopped {}. (id: {})"
+    click.echo(output_str.format(
         style('project', frame.project),
         (" " if frame.tags else "") + style('tags', frame.tags),
         style('time', frame.start.humanize()),
-        style('short_id', frame.id)
+        style('time', frame.stop.humanize()),
+        style('short_id', frame.id),
     ))
     watson.save()
 
@@ -174,6 +277,7 @@ def stop(watson):
 @click.argument('frame', default='-1')
 @click.pass_obj
 @click.pass_context
+@catch_watson_error
 def restart(ctx, watson, frame, stop_):
     """
     Restart monitoring time for a previously stopped project.
@@ -227,6 +331,7 @@ def restart(ctx, watson, frame, stop_):
 
 @cli.command()
 @click.pass_obj
+@catch_watson_error
 def cancel(watson):
     """
     Cancel the last call to the start command. The time will
@@ -248,6 +353,7 @@ def cancel(watson):
 @click.option('-e', '--elapsed', is_flag=True,
               help="only show time elapsed")
 @click.pass_obj
+@catch_watson_error
 def status(watson, project, tags, elapsed):
     """
     Display when the current project was started and the time spent since.
@@ -313,7 +419,7 @@ _SHORTCUT_OPTIONS_VALUES = {
 @click.option('-c/-C', '--current/--no-current', 'current', default=None,
               help="(Don't) include currently running frame in report.")
 @click.option('-f', '--from', 'from_', cls=MutuallyExclusiveOption, type=Date,
-              default=arrow.now().replace(days=-7),
+              default=arrow.now().shift(days=-7),
               mutually_exclusive=_SHORTCUT_OPTIONS,
               help="The date from when the report should start. Defaults "
               "to seven days ago.")
@@ -353,13 +459,33 @@ _SHORTCUT_OPTIONS_VALUES = {
               help="Reports activity only for frames containing the given "
               "tag. You can add several tags by using this option multiple "
               "times")
-@click.option('-j', '--json', 'format_json', is_flag=True,
-              help="Format the report in JSON instead of plain text")
+@click.option('--ignore-project', 'ignore_projects', multiple=True,
+              help="Reports activity for all projects but the given ones. You "
+              "can ignore several projects by using the option multiple "
+              "times. Any given project will be ignored")
+@click.option('--ignore-tag', 'ignore_tags', multiple=True,
+              help="Reports activity for all tags but the given ones. You can "
+              "ignore several tags by using the option multiple times. Any "
+              "given tag will be ignored")
+@click.option('-j', '--json', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='json', mutually_exclusive=['csv'],
+              multiple=True,
+              help="Format output in JSON instead of plain text")
+@click.option('-s', '--csv', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='csv', mutually_exclusive=['json'],
+              multiple=True,
+              help="Format output in CSV instead of plain text")
+@click.option('--plain', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='plain', mutually_exclusive=['json', 'csv'],
+              multiple=True, default=True, hidden=True,
+              help="Format output in plain text (default)")
 @click.option('-g/-G', '--pager/--no-pager', 'pager', default=None,
               help="(Don't) view output through a pager.")
 @click.pass_obj
-def report(watson, current, from_, to, projects, tags, year, month,
-           week, day, luna, all, format_json, pager):
+@catch_watson_error
+def report(watson, current, from_, to, projects, tags, ignore_projects,
+           ignore_tags, year, month, week, day, luna, all, output_format,
+           pager, aggregated=False):
     """
     Display a report of the time spent on each project.
 
@@ -377,15 +503,17 @@ def report(watson, current, from_, to, projects, tags, year, month,
     The shortcut `--luna` sets the timespan to the current moon cycle with
     the last full moon marking the start of the cycle.
 
-    You can limit the report to a project or a tag using the `--project` and
-    `--tag` options. They can be specified several times each to add multiple
-    projects or tags to the report.
+    You can limit the report to a project or a tag using the `--project`,
+    `--tag`, `--ignore-project` and `--ignore-tag` options. They can be
+    specified several times each to add or ignore multiple projects or
+    tags to the report.
 
     If you are outputting to the terminal, you can selectively enable a pager
     through the `--pager` option.
 
     You can change the output format for the report from *plain text* to *JSON*
-    by using the `--json` option.
+    using the `--json` option or to *CSV* using the `--csv` option. Only one
+    of these two options can be used at once.
 
     Example:
 
@@ -453,17 +581,37 @@ def report(watson, current, from_, to, projects, tags, year, month,
             "to": "2016-02-28T23:59:59.999999-08:00"
         }
     }
+    \b
+    $ watson report --from 2014-04-01 --to 2014-04-30 --project apollo11 --csv
+    from,to,project,tag,time
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,,48140.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,brakes,28421.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,module,27701.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,reactor,30950.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,steering,38017.0
+    2014-04-01 00:00:00,2014-04-30 23:59:59,apollo11,wheels,36695.0
     """
-    try:
-        report = watson.report(from_, to, current, projects, tags,
-                               year=year, month=month, week=week, day=day,
-                               luna=luna, all=all)
-    except watson.WatsonError as e:
-        raise click.ClickException(e)
 
-    if format_json:
+    # if the report is an aggregate report, add whitespace using this
+    # aggregate tab which will be prepended to the project name
+    if aggregated:
+        tab = '  '
+    else:
+        tab = ''
+
+    report = watson.report(from_, to, current, projects, tags,
+                           ignore_projects, ignore_tags,
+                           year=year, month=month, week=week, day=day,
+                           luna=luna, all=all)
+
+    if 'json' in output_format and not aggregated:
         click.echo(json.dumps(report, indent=4, sort_keys=True))
         return
+    elif 'csv' in output_format and not aggregated:
+        click.echo(build_csv(flatten_report_for_csv(report)))
+        return
+    elif 'plain' not in output_format and aggregated:
+        return report
 
     lines = []
     # use the pager, or print directly to the terminal
@@ -475,6 +623,13 @@ def report(watson, current, from_, to, projects, tags, year, month,
 
         def _final_print(lines):
             click.echo_via_pager(u'\n'.join(lines))
+    elif aggregated:
+
+        def _print(line):
+            lines.append(line)
+
+        def _final_print(lines):
+            pass
     else:
 
         def _print(line):
@@ -483,18 +638,32 @@ def report(watson, current, from_, to, projects, tags, year, month,
         def _final_print(lines):
             pass
 
-    _print(u'{} -> {}\n'.format(
-        style('date', '{:ddd DD MMMM YYYY}'.format(
-            arrow.get(report['timespan']['from'])
-        )),
-        style('date', '{:ddd DD MMMM YYYY}'.format(
-            arrow.get(report['timespan']['to'])
+    # handle special title formatting for aggregate reports
+    if aggregated:
+        _print(u'{} - {}'.format(
+            style('date', '{:ddd DD MMMM YYYY}'.format(
+                report['timespan']['from']
+            )),
+            style('time', '{}'.format(format_timedelta(
+                datetime.timedelta(seconds=report['time'])
+            )))
         ))
-    ))
+
+    else:
+        _print(u'{} -> {}\n'.format(
+            style('date', '{:ddd DD MMMM YYYY}'.format(
+                report['timespan']['from']
+            )),
+            style('date', '{:ddd DD MMMM YYYY}'.format(
+                report['timespan']['to']
+            ))
+        ))
 
     projects = report['projects']
+
     for project in projects:
-        _print(u'{project} - {time}'.format(
+        _print(u'{tab}{project} - {time}'.format(
+            tab=tab,
             time=style('time', format_timedelta(
                 datetime.timedelta(seconds=project['time'])
             )),
@@ -516,21 +685,170 @@ def report(watson, current, from_, to, projects, tags, year, month,
                 ))
         _print("")
 
-    if len(projects) > 1:
+    # only show total time at the bottom for a project if it is not
+    # an aggregate report and there is greater than 1 project
+    if len(projects) > 1 and not aggregated:
         _print('Total: {}'.format(
             style('time', '{}'.format(format_timedelta(
                 datetime.timedelta(seconds=report['time'])
             )))
         ))
 
-    _final_print(lines)
+    # if this is a report invoked from `aggregate`
+    # return the lines
+    if aggregated:
+        return lines
+    else:
+        _final_print(lines)
+
+
+@cli.command()
+@click.option('-c/-C', '--current/--no-current', 'current', default=None,
+              help="(Don't) include currently running frame in report.")
+@click.option('-f', '--from', 'from_', cls=MutuallyExclusiveOption, type=Date,
+              default=arrow.now().shift(days=-7),
+              mutually_exclusive=_SHORTCUT_OPTIONS,
+              help="The date from when the report should start. Defaults "
+              "to seven days ago.")
+@click.option('-t', '--to', cls=MutuallyExclusiveOption, type=Date,
+              default=arrow.now(),
+              mutually_exclusive=_SHORTCUT_OPTIONS,
+              help="The date at which the report should stop (inclusive). "
+              "Defaults to tomorrow.")
+@click.option('-p', '--project', 'projects', multiple=True,
+              help="Reports activity only for the given project. You can add "
+              "other projects by using this option several times.")
+@click.option('-T', '--tag', 'tags', multiple=True,
+              help="Reports activity only for frames containing the given "
+              "tag. You can add several tags by using this option multiple "
+              "times")
+@click.option('-j', '--json', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='json', mutually_exclusive=['csv'],
+              multiple=True,
+              help="Format output in JSON instead of plain text")
+@click.option('-s', '--csv', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='csv', mutually_exclusive=['json'],
+              multiple=True,
+              help="Format output in CSV instead of plain text")
+@click.option('--plain', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='plain', mutually_exclusive=['json', 'csv'],
+              multiple=True, default=True, hidden=True,
+              help="Format output in plain text (default)")
+@click.option('-g/-G', '--pager/--no-pager', 'pager', default=None,
+              help="(Don't) view output through a pager.")
+@click.pass_obj
+@click.pass_context
+@catch_watson_error
+def aggregate(ctx, watson, current, from_, to, projects, tags, output_format,
+              pager):
+    """
+    Display a report of the time spent on each project aggregated by day.
+
+    If a project is given, the time spent on this project is printed.
+    Else, print the total for each root project.
+
+    By default, the time spent the last 7 days is printed. This timespan
+    can be controlled with the `--from` and `--to` arguments. The dates
+    must have the format `YEAR-MONTH-DAY`, like: `2014-05-19`.
+
+    You can limit the report to a project or a tag using the `--project` and
+    `--tag` options. They can be specified several times each to add multiple
+    projects or tags to the report.
+
+    If you are outputting to the terminal, you can selectively enable a pager
+    through the `--pager` option.
+
+    You can change the output format from *plain text* to *JSON* using the
+    `--json` option or to *CSV* using the `--csv` option. Only one  of these
+    two options can be used at once.
+
+
+    Example:
+
+    \b
+    $ watson aggregate
+    Wed 14 November 2018 - 5h 42m 22s
+      watson - 5h 42m 22s
+            [features     34m 06s]
+            [docs  5h 08m 16s]
+    \b
+    Thu 15 November 2018 - 00s
+    \b
+    Fri 16 November 2018 - 00s
+    \b
+    Sat 17 November 2018 - 00s
+    \b
+    Sun 18 November 2018 - 00s
+    \b
+    Mon 19 November 2018 - 5h 58m 52s
+      watson - 5h 58m 52s
+            [features  1h 12m 03s]
+            [docs  4h 46m 49s]
+    \b
+    Tue 20 November 2018 - 2h 50m 35s
+      watson - 2h 50m 35s
+            [features     15m 17s]
+            [docs  1h 37m 43s]
+            [website     57m 35s]
+    \b
+    Wed 21 November 2018 - 01m 17s
+      watson - 01m 17s
+            [docs     01m 17s]
+    \b
+    $ watson aggregate --csv
+    from,to,project,tag,time
+    2018-11-14 00:00:00,2018-11-14 23:59:59,watson,,20542.0
+    2018-11-14 00:00:00,2018-11-14 23:59:59,watson,features,2046.0
+    2018-11-14 00:00:00,2018-11-14 23:59:59,watson,docs,18496.0
+    2018-11-19 00:00:00,2018-11-19 23:59:59,watson,,21532.0
+    2018-11-19 00:00:00,2018-11-19 23:59:59,watson,features,4323.0
+    2018-11-19 00:00:00,2018-11-19 23:59:59,watson,docs,17209.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,,10235.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,features,917.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,docs,5863.0
+    2018-11-20 00:00:00,2018-11-20 23:59:59,watson,website,3455.0
+    2018-11-21 00:00:00,2018-11-21 23:59:59,watson,,77.0
+    2018-11-21 00:00:00,2018-11-21 23:59:59,watson,docs,77.0
+    """
+    delta = (to - from_).days
+    lines = []
+
+    for i in range(delta + 1):
+        offset = datetime.timedelta(days=i)
+        from_offset = from_ + offset
+        output = ctx.invoke(report, current=current, from_=from_offset,
+                            to=from_offset, projects=projects, tags=tags,
+                            output_format=output_format,
+                            pager=pager, aggregated=True)
+
+        if 'json' in output_format:
+            lines.append(output)
+        elif 'csv' in output_format:
+            lines.extend(flatten_report_for_csv(output))
+        else:
+            # if there is no activity for the day, append a newline
+            # this ensures even spacing throughout the report
+            if (len(output)) == 1:
+                output[0] += '\n'
+
+            lines.append(u'\n'.join(output))
+
+    if 'json' in output_format:
+        click.echo(json.dumps(lines, indent=4, sort_keys=True))
+    elif 'csv' in output_format:
+        click.echo(build_csv(lines))
+    elif pager or (pager is None and
+                   watson.config.getboolean('options', 'pager', True)):
+        click.echo_via_pager(u'\n\n'.join(lines))
+    else:
+        click.echo(u'\n\n'.join(lines))
 
 
 @cli.command()
 @click.option('-c/-C', '--current/--no-current', 'current', default=None,
               help="(Don't) include currently running frame in output.")
 @click.option('-f', '--from', 'from_', type=Date,
-              default=arrow.now().replace(days=-7),
+              default=arrow.now().shift(days=-7),
               help="The date from when the log should start. Defaults "
               "to seven days ago.")
 @click.option('-t', '--to', type=Date, default=arrow.now(),
@@ -567,13 +885,24 @@ def report(watson, current, from_, to, projects, tags, year, month,
               help="Logs activity only for frames containing the given "
               "tag. You can add several tags by using this option multiple "
               "times")
-@click.option('-j', '--json', 'format_json', is_flag=True,
-              help="Format the log in JSON instead of plain text")
+@click.option('-j', '--json', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='json', mutually_exclusive=['csv'],
+              multiple=True,
+              help="Format output in JSON instead of plain text")
+@click.option('-s', '--csv', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='csv', mutually_exclusive=['json'],
+              multiple=True,
+              help="Format output in CSV instead of plain text")
+@click.option('--plain', 'output_format', cls=MutuallyExclusiveOption,
+              flag_value='plain', mutually_exclusive=['json', 'csv'],
+              multiple=True, default=True, hidden=True,
+              help="Format output in plain text (default)")
 @click.option('-g/-G', '--pager/--no-pager', 'pager', default=None,
               help="(Don't) view output through a pager.")
 @click.pass_obj
+@catch_watson_error
 def log(watson, current, from_, to, projects, tags, year, month, week, day,
-        luna, all, format_json, pager):
+        luna, all, output_format, pager):
     """
     Display each recorded session during the given timespan.
 
@@ -594,6 +923,10 @@ def log(watson, current, from_, to, projects, tags, year, month, week, day,
     You can limit the log to a project or a tag using the `--project` and
     `--tag` options. They can be specified several times each to add multiple
     projects or tags to the log.
+
+    You can change the output format from *plain text* to *JSON* using the
+    `--json` option or to *CSV* using the `--csv` option. Only one  of these
+    two options can be used at once.
 
     Example:
 
@@ -623,6 +956,14 @@ def log(watson, current, from_, to, projects, tags, year, month, week, day,
     Wednesday 16 April 2014 (5h 19m 18s)
             02cb269  09:53 to 12:43   2h 50m 07s  apollo11  [wheels]
             1070ddb  13:48 to 16:17   2h 29m 11s  voyager1  [antenna, sensors]
+    \b
+    $ watson log --from 2014-04-16 --to 2014-04-17 --csv
+    id,start,stop,project,tags
+    a96fcde,2014-04-17 09:15,2014-04-17 09:43,hubble,"lens, camera, transmission"
+    5e91316,2014-04-17 10:19,2014-04-17 12:59,hubble,"camera, transmission"
+    761dd51,2014-04-17 14:42,2014-04-17 15:54,voyager1,antenna
+    02cb269,2014-04-16 09:53,2014-04-16 12:43,apollo11,wheels
+    1070ddb,2014-04-16 13:48,2014-04-16 16:17,voyager1,"antenna, sensors"
     """  # noqa
     for start_time in (_ for _ in [day, week, month, luna, year, all]
                        if _ is not None):
@@ -643,18 +984,12 @@ def log(watson, current, from_, to, projects, tags, year, month, week, day,
         projects=projects or None, tags=tags or None, span=span
     )
 
-    if format_json:
-        log = [
-            {
-                'id': frame.id,
-                'start': frame.start.isoformat(),
-                'stop': frame.stop.isoformat(),
-                'project': frame.project,
-                'tags': frame.tags,
-            }
-            for frame in filtered_frames
-        ]
-        click.echo(json.dumps(log, indent=4, sort_keys=True))
+    if 'json' in output_format:
+        click.echo(frames_to_json(filtered_frames))
+        return
+
+    if 'csv' in output_format:
+        click.echo(frames_to_csv(filtered_frames))
         return
 
     frames_by_day = sorted_groupby(
@@ -719,6 +1054,7 @@ def log(watson, current, from_, to, projects, tags, year, month, week, day,
 
 @cli.command()
 @click.pass_obj
+@catch_watson_error
 def projects(watson):
     """
     Display the list of all the existing projects.
@@ -738,6 +1074,7 @@ def projects(watson):
 
 @cli.command()
 @click.pass_obj
+@catch_watson_error
 def tags(watson):
     """
     Display the list of all the tags.
@@ -765,6 +1102,7 @@ def tags(watson):
 
 @cli.command()
 @click.pass_obj
+@catch_watson_error
 def frames(watson):
     """
     Display the list of all frame IDs.
@@ -788,8 +1126,13 @@ def frames(watson):
               help="Date and time of start of tracked activity")
 @click.option('-t', '--to', required=True, type=Date,
               help="Date and time of end of tracked activity")
+@click.option('-c', '--confirm-new-project', is_flag=True, default=False,
+              help="Confirm addition of new project.")
+@click.option('-b', '--confirm-new-tag', is_flag=True, default=False,
+              help="Confirm creation of new tag.")
 @click.pass_obj
-def add(watson, args, from_, to):
+@catch_watson_error
+def add(watson, args, from_, to, confirm_new_project, confirm_new_tag):
     """
     Add time for project with tag(s) that was not tracked live.
 
@@ -803,9 +1146,21 @@ def add(watson, args, from_, to):
     project = ' '.join(
         itertools.takewhile(lambda s: not s.startswith('+'), args)
     )
+    if not project:
+        raise click.ClickException("No project given.")
+
+    # Confirm creation of new project if that option is set
+    if (watson.config.getboolean('options', 'confirm_new_project') or
+            confirm_new_project):
+        confirm_project(project, watson.projects)
 
     # Parse all the tags
     tags = parse_tags(args)
+
+    # Confirm creation of new tag(s) if that option is set
+    if (watson.config.getboolean('options', 'confirm_new_tag') or
+            confirm_new_tag):
+        confirm_tags(tags, watson.tags)
 
     # add a new frame, call watson save to update state files
     frame = watson.add(project=project, tags=tags, from_date=from_, to_date=to)
@@ -822,9 +1177,14 @@ def add(watson, args, from_, to):
 
 
 @cli.command(context_settings={'ignore_unknown_options': True})
+@click.option('-c', '--confirm-new-project', is_flag=True, default=False,
+              help="Confirm addition of new project.")
+@click.option('-b', '--confirm-new-tag', is_flag=True, default=False,
+              help="Confirm creation of new tag.")
 @click.argument('id', required=False)
 @click.pass_obj
-def edit(watson, id):
+@catch_watson_error
+def edit(watson, confirm_new_project, confirm_new_tag, id):
     """
     Edit a frame.
 
@@ -884,7 +1244,15 @@ def edit(watson, id):
         try:
             data = json.loads(output)
             project = data['project']
+            # Confirm creation of new project if that option is set
+            if (watson.config.getboolean('options', 'confirm_new_project') or
+                    confirm_new_project):
+                confirm_project(project, watson.projects)
             tags = data['tags']
+            # Confirm creation of new tag(s) if that option is set
+            if (watson.config.getboolean('options', 'confirm_new_tag') or
+                    confirm_new_tag):
+                confirm_tags(tags, watson.tags)
             start = arrow.get(data['start'], datetime_format).replace(
                 tzinfo=local_tz).to('utc')
             stop = arrow.get(data['stop'], datetime_format).replace(
@@ -897,13 +1265,13 @@ def edit(watson, id):
             # break out of while loop and continue execution of
             #  the edit function normally
             break
-        except (ValueError, RuntimeError) as e:
+        except (ValueError, TypeError, RuntimeError) as e:
             click.echo(u"Error while parsing inputted values: {}".format(e),
                        err=True)
         except KeyError:
             click.echo(
-                "The edited frame must contain the project, \
-                start, and stop keys.", err=True)
+                "The edited frame must contain the project, "
+                "start, and stop keys.", err=True)
         # we reach here if exception was thrown, wait for user
         #  to acknowledge the error before looping in while and
         #  showing user the editor again
@@ -942,6 +1310,7 @@ def edit(watson, id):
 @click.option('-f', '--force', is_flag=True,
               help="Don't ask for confirmation.")
 @click.pass_obj
+@catch_watson_error
 def remove(watson, id, force):
     """
     Remove a frame. You can specify the frame either by id or by position
@@ -974,6 +1343,7 @@ def remove(watson, id, force):
 @click.option('-e', '--edit', is_flag=True,
               help="Edit the configuration file with an editor.")
 @click.pass_context
+@catch_watson_error
 def config(context, key, value, edit):
     """
     Get and set configuration options.
@@ -1011,7 +1381,7 @@ def config(context, key, value, edit):
         except _watson.ConfigurationError as exc:
             watson.config = wconfig
             watson.save()
-            raise WatsonCliError(str(exc))
+            raise click.ClickException(style('error', str(exc)))
         return
 
     if not key:
@@ -1046,6 +1416,7 @@ def config(context, key, value, edit):
 
 @cli.command()
 @click.pass_obj
+@catch_watson_error
 def sync(watson):
     """
     Get the frames from the server and push the new ones.
@@ -1079,6 +1450,7 @@ def sync(watson):
               help="If specified, then the merge will automatically "
               "be performed.")
 @click.pass_obj
+@catch_watson_error
 def merge(watson, frames_with_conflict, force):
     """
     Perform a merge of the existing frames with a conflicting frames file.
@@ -1231,6 +1603,7 @@ def merge(watson, frames_with_conflict, force):
 @click.argument('old_name', required=True)
 @click.argument('new_name', required=True)
 @click.pass_obj
+@catch_watson_error
 def rename(watson, rename_type, old_name, new_name):
     """
     Rename a project or tag.
@@ -1245,25 +1618,17 @@ def rename(watson, rename_type, old_name, new_name):
 
     """
     if rename_type == 'tag':
-        try:
-            watson.rename_tag(old_name, new_name)
-        except ValueError as e:
-            raise click.ClickException(style('error', str(e)))
-        else:
-            click.echo(u'Renamed tag "{}" to "{}"'.format(
-                            style('tag', old_name),
-                            style('tag', new_name)
-                       ))
+        watson.rename_tag(old_name, new_name)
+        click.echo(u'Renamed tag "{}" to "{}"'.format(
+                        style('tag', old_name),
+                        style('tag', new_name)
+                   ))
     elif rename_type == 'project':
-        try:
-            watson.rename_project(old_name, new_name)
-        except ValueError as e:
-            raise click.ClickException(style('error', str(e)))
-        else:
-            click.echo(u'Renamed project "{}" to "{}"'.format(
-                            style('project', old_name),
-                            style('project', new_name)
-                       ))
+        watson.rename_project(old_name, new_name)
+        click.echo(u'Renamed project "{}" to "{}"'.format(
+                        style('project', old_name),
+                        style('project', new_name)
+                   ))
     else:
         raise click.ClickException(style(
             'error',

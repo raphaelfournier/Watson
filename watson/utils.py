@@ -1,3 +1,5 @@
+import collections as co
+import csv
 import datetime
 import itertools
 import json
@@ -6,6 +8,10 @@ import os
 import shutil
 import sys
 import tempfile
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
 
 import click
 import arrow
@@ -21,6 +27,33 @@ try:
     text_type = (str, unicode)
 except NameError:
     text_type = str
+
+
+def confirm_project(project, watson_projects):
+    """
+    Ask user to confirm creation of a new project
+    'project' must be a string
+    'watson_projects' must be an interable.
+    Returns True on accept and raises click.exceptions.Abort on reject
+    """
+    if project not in watson_projects:
+        msg = ("Project '%s' does not exist yet. Create it?"
+               % style('project', project))
+        click.confirm(msg, abort=True)
+    return True
+
+
+def confirm_tags(tags, watson_tags):
+    """
+    Ask user to confirm creation of new tags (each separately)
+    Both 'tags' and 'watson_tags" must be iterables.
+    Returns True if all accepted and raises click.exceptions.Abort on reject
+    """
+    for tag in tags:
+        if tag not in watson_tags:
+            msg = "Tag '%s' does not exist yet. Create it?" % style('tag', tag)
+            click.confirm(msg, abort=True)
+    return True
 
 
 def style(name, element):
@@ -145,7 +178,7 @@ def get_start_time_for_period(period):
     if period == 'day':
         start_time = arrow.Arrow(year, month, day)
     elif period == 'week':
-        start_time = arrow.Arrow.fromdate(now.replace(days=-weekday).date())
+        start_time = arrow.Arrow.fromdate(now.shift(days=-weekday).date())
     elif period == 'month':
         start_time = arrow.Arrow(year, month, 1)
     elif period == 'luna':
@@ -159,6 +192,23 @@ def get_start_time_for_period(period):
         raise ValueError(u'Unsupported period value: {}'.format(period))
 
     return start_time
+
+
+def apply_weekday_offset(start_time, week_start):
+    """
+    Apply the offset required to move the start date `start_time` of a week
+    starting on Monday to that of a week starting on `week_start`.
+    """
+    weekdays = dict(zip(
+        ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+         "sunday"], range(0, 7)))
+
+    new_start = week_start.lower()
+    if new_start not in weekdays:
+        return start_time
+    now = datetime.datetime.now()
+    offset = weekdays[new_start] - 7 * (weekdays[new_start] > now.weekday())
+    return start_time.shift(days=offset)
 
 
 def make_json_writer(func, *args, **kwargs):
@@ -242,3 +292,108 @@ def parse_tags(values_list):
         ))
         for i, w in enumerate(values_list) if w.startswith('+')
     ))))  # pile of pancakes !
+
+
+def frames_to_json(frames):
+    """
+    Transform a sequence of frames into a JSON-formatted string.
+
+    Each frame object has an equivalent pair name/value in the JSON string,
+    except for 'updated_at', which is not included.
+
+    .. seealso:: :class:`Frame`
+    """
+    log = [
+        co.OrderedDict([
+            ('id', frame.id),
+            ('start', frame.start.isoformat()),
+            ('stop', frame.stop.isoformat()),
+            ('project', frame.project),
+            ('tags', frame.tags),
+        ])
+        for frame in frames
+    ]
+    return json.dumps(log, indent=4, sort_keys=True)
+
+
+def frames_to_csv(frames):
+    """
+    Transform a sequence of frames into a CSV-formatted string.
+
+    Each frame object has an equivalent pair name/value in the CSV string,
+    except for 'updated_at', which is not included.
+
+    .. seealso:: :class:`Frame`
+    """
+    entries = [
+        co.OrderedDict([
+            ('id', frame.id[:7]),
+            ('start', frame.start.format('YYYY-MM-DD HH:mm:ss')),
+            ('stop', frame.stop.format('YYYY-MM-DD HH:mm:ss')),
+            ('project', frame.project),
+            ('tags', ', '.join(frame.tags)),
+        ])
+        for frame in frames
+    ]
+    return build_csv(entries)
+
+
+def build_csv(entries):
+    """
+    Creates a CSV string from a list of dict objects.
+
+    The dictionary keys of the first item in the list are used as the header
+    row for the built CSV. All item's keys are supposed to be identical.
+    """
+    if entries:
+        header = entries[0].keys()
+    else:
+        return ''
+    memfile = StringIO()
+    writer = csv.DictWriter(memfile, header)
+    writer.writeheader()
+    writer.writerows(entries)
+    output = memfile.getvalue()
+    memfile.close()
+    return output
+
+
+def flatten_report_for_csv(report):
+    """
+    Flattens the data structure returned by `watson.report()` for a csv export.
+
+    Dates are formatted in a way that Excel (default csv module dialect) can
+    handle them (i.e. YYYY-MM-DD HH:mm:ss).
+
+    The result is a list of dictionaries where each element can contain two
+    different things:
+
+    1. The total `time` spent in a project during the report interval. In this
+       case, the `tag` value will be empty.
+    2. The partial `time` spent in a tag and project during the report
+       interval. In this case, the `tag` value will contain a tag associated
+       with the project.
+
+    The sum of all elements where `tag` is empty corresponds to the total time
+    of the report.
+    """
+    result = []
+    datetime_from = report['timespan']['from'].format('YYYY-MM-DD HH:mm:ss')
+    datetime_to = report['timespan']['to'].format('YYYY-MM-DD HH:mm:ss')
+    for project in report['projects']:
+        result.append({
+            'from': datetime_from,
+            'to': datetime_to,
+            'project': project['name'],
+            'tag': '',
+            'time': project['time']
+        })
+        for tag in project['tags']:
+            result.append({
+                'from': datetime_from,
+                'to': datetime_to,
+                'project': project['name'],
+                'tag': tag['name'],
+                'time': tag['time']
+            })
+    return result

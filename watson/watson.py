@@ -13,7 +13,6 @@ except ImportError:
     import ConfigParser as configparser
 import arrow
 import click
-import requests
 
 from .config import ConfigParser
 from .frames import Frames
@@ -100,9 +99,11 @@ class Watson(object):
             )
 
     def _parse_date(self, date):
+        """Returns Arrow object from timestamp."""
         return arrow.Arrow.utcfromtimestamp(date).to('local')
 
     def _format_date(self, date):
+        """Returns timestamp from string timestamp or Arrow object."""
         if not isinstance(date, arrow.Arrow):
             date = arrow.get(date)
 
@@ -250,10 +251,7 @@ class Watson(object):
         frame = self.frames.add(project, from_date, to_date, tags=tags)
         return frame
 
-    def start(self, project, tags=None, restart=False):
-        if not project:
-            raise WatsonError("No project given.")
-
+    def start(self, project, tags=None, restart=False, gap=True):
         if self.is_started:
             raise WatsonError(
                 u"Project {} is already started.".format(
@@ -265,16 +263,33 @@ class Watson(object):
         if not restart:
             tags = (tags or []) + default_tags
 
-        self.current = {'project': project, 'tags': deduplicate(tags)}
+        new_frame = {'project': project, 'tags': deduplicate(tags)}
+        if not gap:
+            stop_of_prev_frame = self.frames[-1].stop
+            new_frame['start'] = stop_of_prev_frame
+        self.current = new_frame
         return self.current
 
-    def stop(self):
+    def stop(self, stop_at=None):
         if not self.is_started:
             raise WatsonError("No project started.")
 
         old = self.current
+
+        if stop_at is None:
+            # One cannot use `arrow.now()` as default argument. Default
+            # arguments are evaluated when a function is defined, not when its
+            # called. Since there might be huge delays between defining this
+            # stop function and calling it, the value of `stop_at` could be
+            # outdated if defined using a default argument.
+            stop_at = arrow.now()
+        if old['start'] > stop_at:
+            raise WatsonError('Task cannot end before it starts.')
+        if stop_at > arrow.now():
+            raise WatsonError('Task cannot end in the future.')
+
         frame = self.frames.add(
-            old['project'], old['start'], arrow.now(), tags=old['tags']
+            old['project'], old['start'], stop_at, tags=old['tags']
         )
         self.current = None
 
@@ -327,6 +342,8 @@ class Watson(object):
         return dest, headers
 
     def _get_remote_projects(self):
+        # import when required in order to reduce watson response time (#312)
+        import requests
         if not hasattr(self, '_remote_projects'):
             dest, headers = self._get_request_info('projects')
 
@@ -346,6 +363,7 @@ class Watson(object):
         return self._remote_projects['projects']
 
     def pull(self):
+        import requests
         dest, headers = self._get_request_info('frames')
 
         try:
@@ -375,6 +393,7 @@ class Watson(object):
         return frames
 
     def push(self, last_pull):
+        import requests
         dest, headers = self._get_request_info('frames/bulk')
 
         frames = []
@@ -426,42 +445,56 @@ class Watson(object):
 
         return conflicting, merging
 
+    def _validate_report_options(self, filtrate, ignored):
+        return not bool(
+            filtrate and ignored and set(filtrate).intersection(set(ignored)))
+
     def report(self, from_, to, current=None, projects=None, tags=None,
-               year=None, month=None, week=None, day=None, luna=None,
-               all=None):
+               ignore_projects=None, ignore_tags=None, year=None,
+               month=None, week=None, day=None, luna=None, all=None):
         for start_time in (_ for _ in [day, week, month, year, luna, all]
                            if _ is not None):
             from_ = start_time
 
+        if not self._validate_report_options(projects, ignore_projects):
+            raise WatsonError(
+                "given projects can't be ignored at the same time")
+
+        if not self._validate_report_options(tags, ignore_tags):
+            raise WatsonError("given tags can't be ignored at the same time")
+
         if from_ > to:
             raise WatsonError("'from' must be anterior to 'to'")
 
-        if tags is None:
-            tags = []
+        if current is None:
+            current = self.config.getboolean('options', 'report_current')
 
-        if self.current:
-            if current or (current is None and
-                           self.config.getboolean(
-                               'options', 'report_current')):
-                cur = self.current
-                self.frames.add(cur['project'], cur['start'], arrow.utcnow(),
-                                cur['tags'], id="current")
+        if self.current and current:
+            cur = self.current
+            self.frames.add(cur['project'], cur['start'], arrow.utcnow(),
+                            cur['tags'], id="current")
 
         span = self.frames.span(from_, to)
 
         frames_by_project = sorted_groupby(
             self.frames.filter(
-                projects=projects or None, tags=tags or None, span=span
+                projects=projects or None, tags=tags or None,
+                ignore_projects=ignore_projects or None,
+                ignore_tags=ignore_tags or None,
+                span=span
             ),
             operator.attrgetter('project')
         )
+
+        if self.current and current:
+            del self.frames['current']
 
         total = datetime.timedelta()
 
         report = {
              'timespan': {
-                 'from': str(span.start),
-                 'to': str(span.stop),
+                 'from': span.start,
+                 'to': span.stop,
              },
              'projects': []
          }
@@ -480,6 +513,9 @@ class Watson(object):
                 'time': delta.total_seconds(),
                 'tags': []
             }
+
+            if tags is None:
+                tags = []
 
             tags_to_print = sorted(
                 set(tag for frame in frames for tag in frame.tags
@@ -506,7 +542,7 @@ class Watson(object):
     def rename_project(self, old_project, new_project):
         """Rename a project in all affected frames."""
         if old_project not in self.projects:
-            raise ValueError(u'Project "%s" does not exist' % old_project)
+            raise WatsonError(u'Project "%s" does not exist' % old_project)
 
         updated_at = arrow.utcnow()
         # rename project
@@ -523,7 +559,7 @@ class Watson(object):
     def rename_tag(self, old_tag, new_tag):
         """Rename a tag in all affected frames."""
         if old_tag not in self.tags:
-            raise ValueError(u'Tag "%s" does not exist' % old_tag)
+            raise WatsonError(u'Tag "%s" does not exist' % old_tag)
 
         updated_at = arrow.utcnow()
         # rename tag
